@@ -8,22 +8,24 @@ import numpy as np
 from xai import get_gradcam_plusplus, get_gradcam
 import matplotlib.cm as cm
 
+SIZE = 224
+
 app = Flask(__name__)
 CORS(app) # Engedélyezi, hogy a weboldal kommunikáljon a szerverrel
-model = tf.keras.models.load_model('mednet_modell_128_31.keras')
+model = tf.keras.models.load_model('cnn.keras')
 class_names = ['Basophil', 'Eosinophil', 'Erythroblast', 'Immature granulocyte', 'Lymphocyte', 'Monocyte', 'Neutrophil', 'Platelet']
 
 def analyze_image(image_bytes):
     img = Image.open(io.BytesIO(image_bytes))
     img = img.convert('RGB')
-    img = img.resize((128, 128))
+    img = img.resize((SIZE, SIZE))
     img_array = np.array(img)
     img_array = img_array / 255.0
     img_array = np.expand_dims(img_array, axis=0)
     predictions = model.predict(img_array)
 
 
-    heatmap = get_gradcam_plusplus(img_array, model, last_conv_layer_name='gradcam_target_layer')
+    heatmap = get_gradcam_plusplus(img_array, model, last_conv_layer_name='last_conv')
 
     heatmap_img = Image.fromarray(np.uint8(255 * heatmap))
     heatmap_img = heatmap_img.resize(img.size, Image.Resampling.BILINEAR)

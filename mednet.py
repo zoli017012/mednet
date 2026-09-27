@@ -10,6 +10,59 @@ import tensorflow as tf
 from keras.preprocessing.image import ImageDataGenerator
 
 size = 128
+EPOCHS = 70
+LR_MAX = 3e-4          # Kezdeti learning rate
+LR_MIN = 1e-6          # η_min
+T_MAX = 20             # T_max (epochban megadva)
+WEIGHT_DECAY = 1e-4
+
+class SparseFocalLoss(tf.keras.losses.Loss):
+    def __init__(self, gamma=2.0, alpha=0.25, **kwargs):
+        """
+        Focal Loss inicializálása.
+        :param gamma: A könnyű példák súlyának csökkentését szabályozza (általában 2.0).
+        :param alpha: Osztály-egyensúlyozó tényező (általában 0.25).
+        """
+        super().__init__(**kwargs)
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def call(self, y_true, y_pred):
+        # 1. Numerikus stabilitás: megakadályozzuk a log(0) kialakulását
+        epsilon = tf.keras.backend.epsilon()
+        y_pred = tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)
+        
+        # 2. Sparse címkék (pl. [2, 0, 1]) átalakítása One-hot formátumba (pl. [[0,0,1], [1,0,0], [0,1,0]])
+        num_classes = tf.shape(y_pred)[-1]
+        y_true = tf.cast(tf.reshape(y_true, [-1]), tf.int32) # Biztosítjuk a megfelelő dimenziót
+        y_true_one_hot = tf.one_hot(y_true, depth=num_classes)
+        
+        # 3. Keresztentrópia (Cross Entropy) kiszámítása
+        cross_entropy = -y_true_one_hot * tf.math.log(y_pred)
+        
+        # 4. Focal Loss modulációs tényező: alpha * (1 - p_t)^gamma
+        weight = self.alpha * tf.math.pow(1.0 - y_pred, self.gamma)
+        
+        # 5. Végső loss kiszámítása
+        focal_loss = weight * cross_entropy
+        
+        # Szummázás az osztályok mentén (mivel csak a helyes osztálynál lesz 0-tól eltérő érték)
+        return tf.reduce_sum(focal_loss, axis=-1)
+
+def cosine_annealing(epoch, lr):
+    t_cur = epoch % (2 * T_MAX)
+    
+    if t_cur > T_MAX:
+        t_cur = (2 * T_MAX) - t_cur
+        
+    new_lr = LR_MIN + 0.5 * (LR_MAX - LR_MIN) * (1 + np.cos(np.pi * t_cur / T_MAX))
+    return new_lr
+
+optimizer = tf.keras.optimizers.experimental.AdamW(
+    learning_rate=LR_MAX,
+    weight_decay=WEIGHT_DECAY,
+    jit_compile=False
+)
 
 def cbam_module(inputs, reduction_ratio=8):
     channels = inputs.shape[-1]
@@ -38,64 +91,40 @@ def cbam_module(inputs, reduction_ratio=8):
     return Multiply()([cbam_feature, spatial_attention])
 
 def residual_dscbam_block(inputs, filters, stride=1):
-    """A hálózat magját alkotó ResidualDSCBAMBlock."""
-    # 1. Depthwise Separable Convolution
     x = SeparableConv2D(filters, kernel_size=3, strides=stride, padding='same', use_bias=False)(inputs)
     x = BatchNormalization()(x)
     x = ReLU()(x)
 
-    # 2. Depthwise Separable Convolution
     x = SeparableConv2D(filters, kernel_size=3, strides=1, padding='same', use_bias=False)(x)
     x = BatchNormalization()(x)
     x = ReLU()(x)
 
-    # 3. CBAM figyelem modul
     x = cbam_module(x)
 
-    # 4. Residual (Shortcut) kapcsolat
     shortcut = inputs
     
-    # Ha a térbeli méret (stride > 1) csökken, vagy a csatornák száma eltér, 
-    # 1x1 konvolúcióval hozzuk közös dimenzióba, ahogy a leírás is kéri.
     if stride != 1 or inputs.shape[-1] != filters:
         shortcut = Conv2D(filters, kernel_size=1, strides=stride, padding='same', use_bias=False)(inputs)
-        shortcut = BatchNormalization()(shortcut) # Kerasban a BN ajánlott a 1x1 conv után is
+        shortcut = BatchNormalization()(shortcut) 
 
-    # Hozzáadjuk a shortcutot (reziduális kapcsolat)
     x = Add()([x, shortcut])
     return x
 
 def build_mednet(input_shape=(size, size, 3), num_classes=2):
-    """A MedNet modell felépítése az 5 fázis alapján."""
     inputs = Input(shape=input_shape)
 
-    # Stage 1: 64 filter, stride 1
     x = residual_dscbam_block(inputs, filters=64, stride=1)
-
-    # Stage 2: 128 filter, stride 2
     x = residual_dscbam_block(x, filters=128, stride=2)
-
-    # Stage 3: 256 filter, stride 2
     x = residual_dscbam_block(x, filters=256, stride=2)
-
-    # Stage 4: 512 filter, stride 2
     x = residual_dscbam_block(x, filters=512, stride=2)
-
-    # Stage 5: 1024 filter, stride 2
     x = residual_dscbam_block(x, filters=1024, stride=2)
 
     x = keras.layers.Activation('linear', name='gradcam_target_layer')(x)
 
-    # Classifier Head (Osztályozó modul)
-    x = GlobalAveragePooling2D()(x) # "Adaptive average pooling" Keras megfelelője
+    x = GlobalAveragePooling2D()(x)
     x = Dropout(0.4)(x)
 
-    # Első FC (Linear) réteg
-    # Megjegyzés: A tanulmány szövege ellentmondásos (fent 256-ot, lent 512-t ír). 
-    # Itt a 256-ot használtam az első bekezdés specifikációja alapján.
     x = Dense(256, activation='relu')(x)
-
-    # Végső klasszifikációs réteg
     outputs = Dense(num_classes, activation='softmax')(x)
 
     return Model(inputs, outputs, name="MedNet")
@@ -120,8 +149,8 @@ y_test = np.squeeze(test_dataset.labels)
 
 
 model.compile(
-    optimizer=keras.optimizers.Adam(learning_rate = 0.0003),
-    loss='sparse_categorical_crossentropy',
+    optimizer=optimizer,
+    loss=SparseFocalLoss(gamma=2.0, alpha=0.25),
     metrics=['accuracy']
 )
 datagen = ImageDataGenerator(
